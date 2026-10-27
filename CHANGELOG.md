@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Opt-in verbatim write-ahead log payloads.** `wal_store_full_payload` (or `MEMPALACE_WAL_STORE_FULL_PAYLOAD`) records write payloads in the WAL instead of replacing them with `[REDACTED N chars]`, so a write lost to a storage-layer fault can be reconstructed from the log. Enabling it also lifts the 200-character preview cap that `add_drawer`, `delete_drawer`, `update_drawer`, and `diary_write` applied before logging — otherwise a multi-kilobyte entry would still be recoverable only as its first 200 characters. Off by default and fails closed, leaving existing behaviour byte-identical; intended for self-hosted single-user palaces, where the WAL is already `0o600` inside a `0o700` directory.
 
+### Bug Fixes
+
+- **One idle MCP session no longer makes every other session read-only.** The peer-writer guard (#1818) held the per-palace lease for the whole life of the first `mempalace-mcp` process that wrote, so with several Claude Code sessions open every other server refused `diary_write` / `kg_add` with "Peer MCP writer active" until that process exited. The lease is now taken per mutating call: the server drops its cached Chroma client (so it re-reads what peers wrote), runs the tool, closes the client, and releases the lease. A server that finds the lease busy waits up to `MEMPALACE_MCP_WRITER_WAIT_SECS` (default 10) before refusing.
+
 ---
 
 ## [3.6.0] — 2026-07-14

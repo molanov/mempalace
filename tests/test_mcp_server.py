@@ -5103,6 +5103,8 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
         return _DummyLock()
 
     monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setenv(mcp_server._MCP_WRITER_WAIT_ENV, "0")
+    monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
     monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
@@ -5122,6 +5124,93 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
     assert calls["count"] == 2  # retried, not stranded read-only
     assert mcp_server._MCP_WRITER_LOCK_CM is not None
     assert mcp_server._MCP_WRITER_READ_ONLY is False
+
+
+def test_peer_writer_waits_briefly_for_busy_lease(monkeypatch):
+    """A lease held only for the length of a peer's write is waited for, not refused."""
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def busy_then_free(palace_path):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise palace.MineAlreadyRunning("held by pid=999")
+        return _DummyLock()
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setenv(mcp_server._MCP_WRITER_WAIT_ENV, "5")
+    monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+    monkeypatch.setattr(palace, "mine_palace_lock", busy_then_free)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+
+    assert mcp_server._acquire_mcp_writer_lock() == (True, "")
+    assert calls["count"] == 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock probe is POSIX-only")
+def test_mutating_tool_call_releases_writer_lease(monkeypatch, tmp_path):
+    """After a mutating call returns, the flock is free for a peer process.
+
+    Regression: the lease used to be held for the process lifetime, so one idle
+    session left every other mempalace-mcp read-only until it exited.
+    """
+    import fcntl
+
+    from mempalace import mcp_server
+
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path)
+    monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": palace_path})())
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_mcp_sqlite_integrity_refusal", lambda *a: None)
+
+    held = {}
+
+    def handler(**kwargs):
+        held["cm"] = mcp_server._MCP_WRITER_LOCK_CM is not None
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_kg_add",
+        {
+            "description": "t",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": handler,
+        },
+    )
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_kg_add", "arguments": {}},
+        }
+    )
+    assert "result" in response
+    assert held["cm"] is True
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+    import hashlib
+
+    key = hashlib.sha256(os.path.normcase(os.path.realpath(palace_path)).encode()).hexdigest()[:16]
+    lock_path = os.path.expanduser(f"~/.mempalace/locks/mine_palace_{key}.lock")
+    # A separate open file description contends like a peer process would.
+    with open(lock_path, "r+b") as peer:
+        fcntl.flock(peer, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
+        fcntl.flock(peer, fcntl.LOCK_UN)
 
 
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
