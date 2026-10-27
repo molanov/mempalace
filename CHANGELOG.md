@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **One idle MCP session no longer makes every other session read-only.** The peer-writer guard (#1818) held the per-palace lease for the whole life of the first `mempalace-mcp` process that wrote, so with several Claude Code sessions open every other server refused `diary_write` / `kg_add` with "Peer MCP writer active" until that process exited. The lease is now taken per mutating call: the server drops its cached Chroma client (so it re-reads what peers wrote), runs the tool, closes the client, and releases the lease. A server that finds the lease busy waits up to `MEMPALACE_MCP_WRITER_WAIT_SECS` (default 10) before refusing.
+
 ---
 
 ## [3.6.0] — 2026-07-14

@@ -21,6 +21,7 @@ Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
 """
 
+import math
 import os
 import sys
 
@@ -373,14 +374,20 @@ _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
-# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
-# lifetime. A peer MCP process can still serve read tools, but mutating tools
-# refuse before touching Chroma or the knowledge graph.
+# HNSW/FTS state. Each mutating tool call takes the same per-palace mine lock
+# as a lease, drops this process's Chroma caches so it re-reads what peers
+# wrote, and on return closes the client and releases the lease. Holding the
+# lease for the process lifetime (the original design) let one idle session
+# strand every other session read-only until it exited. A peer that finds the
+# lease taken waits up to MEMPALACE_MCP_WRITER_WAIT_SECS for it, then refuses
+# before touching Chroma or the knowledge graph.
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+_MCP_WRITER_WAIT_ENV = "MEMPALACE_MCP_WRITER_WAIT_SECS"
+_MCP_WRITER_WAIT_DEFAULT = 10.0
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -410,17 +417,14 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
-    when another live writer already owns the per-palace lease.
+    when another live writer still owns the per-palace lease after waiting
+    up to ``MEMPALACE_MCP_WRITER_WAIT_SECS`` (default 10 s).
 
-    Self-healing: a server that came up read-only (a peer held the lease at
-    startup) RE-ATTEMPTS the non-blocking flock on every subsequent call.
-    ``_mcp_peer_writer_refusal`` invokes this on each mutating tool, so once
-    the original holder exits — the OS releases its flock on process death —
-    the next mutating call transparently promotes this server to writer, with
-    no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
-    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` is now only a
-    status flag; it no longer short-circuits the retry (that sticky latch used
-    to strand a server read-only for life even after the peer was long gone).
+    The lease is per call: ``_release_mcp_writer_lock`` gives it back when the
+    mutating tool returns, so peers only contend for the length of one write.
+    The flock is arbitrated by the kernel (LOCK_NB), so two servers can never
+    both win. A dead holder's flock is released by the OS. ``_MCP_WRITER_READ_ONLY``
+    is only a status flag for the last refusal.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
@@ -432,25 +436,36 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
-    # the lease at startup we fall through and retry mine_palace_lock below, so
-    # the server self-heals into the writer the moment the peer exits. A broken
-    # lock *mechanism* (below) is still cached, since retrying it can't help.
+    # NB: no sticky read-only short-circuit: a refused call doesn't stop the
+    # next one retrying. A broken lock *mechanism* (below) is cached, since
+    # retrying it can't help.
     if _MCP_WRITER_LOCK_FAILED:
         return True, _MCP_WRITER_LOCK_ERROR
 
     try:
+        wait = float(os.environ.get(_MCP_WRITER_WAIT_ENV, _MCP_WRITER_WAIT_DEFAULT))
+    except ValueError:
+        wait = _MCP_WRITER_WAIT_DEFAULT
+    if not math.isfinite(wait):  # nan/inf would never reach the deadline
+        wait = _MCP_WRITER_WAIT_DEFAULT
+    deadline = time.monotonic() + wait
+    try:
         from .palace import MineAlreadyRunning, mine_palace_lock
 
-        lock_cm = mine_palace_lock(_config.palace_path)
-        lock_cm.__enter__()
-    except MineAlreadyRunning as exc:
-        _MCP_WRITER_READ_ONLY = True
-        _MCP_WRITER_LOCK_ERROR = (
-            "another mempalace writer already holds the palace lock for "
-            f"{_config.palace_path!r}: {exc}"
-        )
-        return False, _MCP_WRITER_LOCK_ERROR
+        while True:
+            try:
+                lock_cm = mine_palace_lock(_config.palace_path)
+                lock_cm.__enter__()
+                break
+            except MineAlreadyRunning as exc:
+                if time.monotonic() >= deadline:
+                    _MCP_WRITER_READ_ONLY = True
+                    _MCP_WRITER_LOCK_ERROR = (
+                        "another mempalace writer already holds the palace lock for "
+                        f"{_config.palace_path!r}: {exc}"
+                    )
+                    return False, _MCP_WRITER_LOCK_ERROR
+                time.sleep(0.1)
     except Exception as exc:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
@@ -461,14 +476,35 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         logger.warning(_MCP_WRITER_LOCK_ERROR)
         return True, _MCP_WRITER_LOCK_ERROR
 
+    # Peers may have written since our client cached HNSW/FTS state; reopen.
+    # Preflight runs outside the dispatch try/finally, so don't keep the
+    # lease if this raises.
+    try:
+        _force_chroma_cache_reset()
+    except BaseException:
+        lock_cm.__exit__(None, None, None)
+        raise
     _MCP_WRITER_LOCK_CM = lock_cm
-    import atexit
-
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
     return True, ""
+
+
+def _release_mcp_writer_lock() -> None:
+    """Close this process's Chroma client and give the writer lease back."""
+    global _MCP_WRITER_LOCK_CM
+
+    lock_cm = _MCP_WRITER_LOCK_CM
+    if lock_cm is None:
+        return
+    _MCP_WRITER_LOCK_CM = None
+    try:
+        # Close while still holding the lease so any flush lands before a
+        # peer opens the palace.
+        _force_chroma_cache_reset()
+    finally:
+        lock_cm.__exit__(None, None, None)
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
@@ -4885,6 +4921,9 @@ def handle_request(request):
             return _internal_tool_error(req_id, tool_name, e)
         except Exception as exc:
             return _internal_tool_error(req_id, tool_name, exc)
+        finally:
+            if tool_name in _MUTATING_TOOLS:
+                _release_mcp_writer_lock()
 
     # Notifications (missing id) must never get a response
     if req_id is None:
